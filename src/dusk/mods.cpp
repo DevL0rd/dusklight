@@ -121,8 +121,11 @@ void watch_thread(std::vector<std::string> roots) {
                 (ev->mask & IN_CREATE)) {
                 addWatch(it->second + "/" + ev->name);  // a mod folder (re)appeared
             }
-            if (!(ev->mask & IN_ISDIR)) {
-                g_libsChanged.store(true);  // a file finished writing; main thread checks which
+            // Only react once a write has finished (IN_CLOSE_WRITE) or a file was
+            // moved into place (IN_MOVED_TO) -- never on IN_CREATE, which fires
+            // mid-write and would load a half-written library ("file too short").
+            if (!(ev->mask & IN_ISDIR) && (ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO))) {
+                g_libsChanged.store(true);
             }
             p += sizeof(struct inotify_event) + ev->len;
         }
@@ -628,9 +631,10 @@ bool reload(std::string_view id) {
     if (entry->enabled) {
         unload_mod(*entry);  // dispose + SDL_UnloadObject
     }
-    const bool ok = load_mod(*entry);  // re-reads the library from disk
-    write_config(*entry);
-    return ok;
+    // Don't persist here: reload is a transient operation and the enabled intent
+    // hasn't changed. Persisting a failed reload would wrongly disable the mod in
+    // its config.
+    return load_mod(*entry);  // re-reads the library from disk
 }
 
 void update() {
