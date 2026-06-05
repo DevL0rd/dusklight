@@ -68,6 +68,10 @@ void refresh();
 // rebuilt mod be tested without restarting the game. Returns true on success.
 bool reload(std::string_view id);
 
+// Per-frame poll: watches each loaded mod's library file and hot-reloads it when
+// it changes on disk. Call once per frame from the main loop.
+void update();
+
 // All discovered mods, in discovery order. Stored in a deque so element
 // addresses stay stable as mods are discovered at runtime (loaded mods hold a
 // pointer to their entry).

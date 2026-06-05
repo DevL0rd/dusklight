@@ -5,12 +5,22 @@
 
 #include "nlohmann/json.hpp"
 
+#include <atomic>
 #include <deque>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#if defined(__linux__)
+#include <poll.h>
+#include <sys/inotify.h>
+#include <unistd.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
 
 #include "dusk/data.hpp"
 #include "dusk/io.hpp"
@@ -35,12 +45,172 @@ constexpr const char* kLibExt = ".so";
 struct LoadedLib {
     SDL_SharedObject* handle = nullptr;
     DuskModDisposeFn dispose = nullptr;
+    fs::file_time_type mtime{};  // library file mtime when loaded (for hot-reload)
 };
 
 // A deque keeps element addresses stable as mods are discovered (at startup or
 // via refresh()), so &ModEntry handed to a loaded mod as DuskMod* stays valid.
 std::deque<ModEntry> g_entries;
 std::unordered_map<std::string, LoadedLib> g_loaded;  // keyed by mod id
+
+// ---- hot-reload file watcher ------------------------------------------------
+// A background thread waits on OS file-change events for the mods folders and
+// just raises g_libsChanged. update() (main thread) reacts: dlopen/dlclose and
+// hook patching must run on the game thread, not the watcher thread.
+
+std::atomic<bool> g_libsChanged{false};
+std::thread g_watchThread;
+std::atomic<bool> g_watchStop{false};
+
+#if defined(__linux__)
+int g_stopPipe[2] = {-1, -1};
+
+void watch_thread(std::vector<std::string> roots) {
+    const int fd = inotify_init1(0);
+    if (fd < 0) {
+        return;
+    }
+    std::unordered_map<int, std::string> watched;
+    const auto addWatch = [&](const std::string& dir) {
+        const int wd = inotify_add_watch(fd, dir.c_str(), IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE);
+        if (wd >= 0) {
+            watched[wd] = dir;
+        }
+    };
+    // Watch each mods root (for new mod folders) and every existing mod folder.
+    for (const std::string& root : roots) {
+        std::error_code ec;
+        if (!fs::exists(root, ec)) {
+            continue;
+        }
+        addWatch(root);
+        for (const auto& e : fs::directory_iterator(root, ec)) {
+            if (e.is_directory(ec)) {
+                addWatch(e.path().string());
+            }
+        }
+    }
+
+    struct pollfd pfds[2];
+    pfds[0].fd = fd;
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+    pfds[1].fd = g_stopPipe[0];
+    pfds[1].events = POLLIN;
+    pfds[1].revents = 0;
+    alignas(struct inotify_event) char buf[8192];
+
+    while (!g_watchStop.load()) {
+        if (poll(pfds, 2, -1) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (pfds[1].revents & POLLIN) {
+            break;  // stop requested
+        }
+        if (!(pfds[0].revents & POLLIN)) {
+            continue;
+        }
+        const ssize_t len = read(fd, buf, sizeof(buf));
+        for (char* p = buf; len > 0 && p < buf + len;) {
+            auto* ev = reinterpret_cast<struct inotify_event*>(p);
+            auto it = watched.find(ev->wd);
+            if (it != watched.end() && ev->len > 0 && (ev->mask & IN_ISDIR) &&
+                (ev->mask & IN_CREATE)) {
+                addWatch(it->second + "/" + ev->name);  // a mod folder (re)appeared
+            }
+            if (!(ev->mask & IN_ISDIR)) {
+                g_libsChanged.store(true);  // a file finished writing; main thread checks which
+            }
+            p += sizeof(struct inotify_event) + ev->len;
+        }
+    }
+
+    for (const auto& kv : watched) {
+        inotify_rm_watch(fd, kv.first);
+    }
+    close(fd);
+}
+
+void start_watcher(std::vector<std::string> roots) {
+    if (pipe(g_stopPipe) != 0) {
+        return;
+    }
+    g_watchStop.store(false);
+    g_watchThread = std::thread(watch_thread, std::move(roots));
+}
+
+void stop_watcher() {
+    if (!g_watchThread.joinable()) {
+        return;
+    }
+    g_watchStop.store(true);
+    const char c = 'x';
+    [[maybe_unused]] ssize_t w = write(g_stopPipe[1], &c, 1);
+    g_watchThread.join();
+    close(g_stopPipe[0]);
+    close(g_stopPipe[1]);
+    g_stopPipe[0] = g_stopPipe[1] = -1;
+}
+
+#elif defined(_WIN32)
+HANDLE g_stopEvent = nullptr;
+
+void watch_thread(std::vector<std::string> roots) {
+    std::vector<HANDLE> handles;
+    for (const std::string& root : roots) {
+        const HANDLE h = FindFirstChangeNotificationA(
+            root.c_str(), TRUE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
+        if (h != INVALID_HANDLE_VALUE) {
+            handles.push_back(h);
+        }
+    }
+    const size_t notifyCount = handles.size();
+    handles.push_back(g_stopEvent);
+
+    while (!g_watchStop.load()) {
+        const DWORD r =
+            WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(), FALSE, INFINITE);
+        const DWORD idx = r - WAIT_OBJECT_0;
+        if (idx >= handles.size() || idx == notifyCount) {
+            break;  // stop event or error
+        }
+        g_libsChanged.store(true);
+        FindNextChangeNotification(handles[idx]);
+    }
+
+    for (size_t i = 0; i < notifyCount; ++i) {
+        FindCloseChangeNotification(handles[i]);
+    }
+}
+
+void start_watcher(std::vector<std::string> roots) {
+    g_stopEvent = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    g_watchStop.store(false);
+    g_watchThread = std::thread(watch_thread, std::move(roots));
+}
+
+void stop_watcher() {
+    if (!g_watchThread.joinable()) {
+        return;
+    }
+    g_watchStop.store(true);
+    if (g_stopEvent != nullptr) {
+        SetEvent(g_stopEvent);
+    }
+    g_watchThread.join();
+    if (g_stopEvent != nullptr) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+    }
+}
+
+#else  // no file-watch support on this platform
+void start_watcher(std::vector<std::string>) {}
+void stop_watcher() {}
+#endif
 
 ModEntry* find_entry(std::string_view id) {
     for (ModEntry& e : g_entries) {
@@ -237,7 +407,9 @@ bool load_mod(ModEntry& entry) {
         return false;
     }
 
-    g_loaded[entry.id] = LoadedLib{handle, dispose};
+    std::error_code mtimeEc;
+    g_loaded[entry.id] =
+        LoadedLib{handle, dispose, fs::last_write_time(entry.libraryPath, mtimeEc)};
     entry.enabled = true;
     DuskLog.info("Enabled mod '{}' ({})", entry.id, entry.version);
     return true;
@@ -407,9 +579,18 @@ void initialize() {
             load_mod(entry);
         }
     }
+
+    // Watch the mods folders for live edits (hot-reload).
+    std::vector<std::string> roots;
+    if (const char* base = SDL_GetBasePath()) {
+        roots.push_back((fs::path(base) / "mods").string());
+    }
+    roots.push_back((dusk::data::configured_data_path() / "mods").string());
+    start_watcher(std::move(roots));
 }
 
 void shutdown() {
+    stop_watcher();
     for (ModEntry& entry : g_entries) {
         if (entry.enabled) {
             unload_mod(entry);
@@ -450,6 +631,33 @@ bool reload(std::string_view id) {
     const bool ok = load_mod(*entry);  // re-reads the library from disk
     write_config(*entry);
     return ok;
+}
+
+void update() {
+    // Near-free per frame: one atomic load. Real work only when the watcher
+    // thread saw a file-change event -- no disk polling.
+    if (!g_libsChanged.exchange(false)) {
+        return;
+    }
+
+    // Something under the mods folders changed; reload any loaded mod whose
+    // library file is now newer than when it was loaded.
+    for (ModEntry& entry : g_entries) {
+        if (!entry.enabled) {
+            continue;
+        }
+        auto loaded = g_loaded.find(entry.id);
+        if (loaded == g_loaded.end()) {
+            continue;
+        }
+        std::error_code ec;
+        const fs::file_time_type t = fs::last_write_time(entry.libraryPath, ec);
+        if (ec || t == loaded->second.mtime) {
+            continue;
+        }
+        DuskLog.info("Mod '{}' library changed; hot-reloading", entry.id);
+        reload(entry.id);  // re-reads the library + records the new mtime
+    }
 }
 
 const std::deque<ModEntry>& list() {

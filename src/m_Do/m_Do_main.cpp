@@ -190,6 +190,7 @@ bool launchUILoop() {
         }
 
         dusk::ui::update();
+        dusk::mods::update();
 
         dusk::g_imguiConsole.PreDraw();
         dusk::g_imguiConsole.PostDraw();
@@ -284,6 +285,7 @@ void main01(void) {
         mDoGph_gInf_c::updateRenderSize();
 
         dusk::ui::update();
+        dusk::mods::update();
 
         const auto pacing = dusk::game_clock::advance_main_loop();
         if (pacing.is_interpolating) {

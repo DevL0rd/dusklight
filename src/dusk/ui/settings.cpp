@@ -1584,14 +1584,6 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                         });
                     }
                 }
-
-                // Separate section: reload (disable+unload then load) so a
-                // rebuilt mod can be tested without restarting the game.
-                pane.add_section("Maintenance");
-                pane.add_button(Rml::String{"Reload"}).on_pressed([id] {
-                    mDoAud_seStartMenu(kSoundItemChange);
-                    mods::reload(id);
-                });
             });
         }
     });
