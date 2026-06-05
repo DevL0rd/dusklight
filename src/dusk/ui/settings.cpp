@@ -1495,15 +1495,22 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
         auto& leftPane = add_child<Pane>(content, Pane::Type::Controlled);
         auto& rightPane = add_child<Pane>(content, Pane::Type::Controlled);
 
+        // Re-scan the mods folder, enable + load anything new, and rebuild this
+        // tab so it shows up.
+        leftPane.add_section("Mods");
+        leftPane.add_button(Rml::String{"Refresh Mods"}).on_pressed([this] {
+            mDoAud_seStartMenu(kSoundItemChange);
+            mods::refresh();
+            refresh_active_tab();
+        });
+
         const auto& entries = mods::list();
         if (entries.empty()) {
-            leftPane.add_section("Mods");
             leftPane.add_text("No mods installed.");
             leftPane.add_rml(
                 "<br/>Each mod is a folder inside the <b>mods</b> folder in your Dusklight data "
                 "folder, containing a library for your platform (<i>.so</i>, <i>.dll</i>, or "
-                "<i>.dylib</i>). Restart to detect newly added mods; they then load and unload "
-                "live as you toggle them here.");
+                "<i>.dylib</i>). Add one and press <b>Refresh Mods</b>.");
             return;
         }
 
@@ -1577,6 +1584,14 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
                         });
                     }
                 }
+
+                // Separate section: reload (disable+unload then load) so a
+                // rebuilt mod can be tested without restarting the game.
+                pane.add_section("Maintenance");
+                pane.add_button(Rml::String{"Reload"}).on_pressed([id] {
+                    mDoAud_seStartMenu(kSoundItemChange);
+                    mods::reload(id);
+                });
             });
         }
     });

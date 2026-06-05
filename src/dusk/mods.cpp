@@ -5,6 +5,7 @@
 
 #include "nlohmann/json.hpp"
 
+#include <deque>
 #include <filesystem>
 #include <string>
 #include <unordered_map>
@@ -36,9 +37,9 @@ struct LoadedLib {
     DuskModDisposeFn dispose = nullptr;
 };
 
-// g_entries is fully populated during initialize() and never reallocated
-// afterwards, so &ModEntry stays stable and is safe to hand to mods as DuskMod*.
-std::vector<ModEntry> g_entries;
+// A deque keeps element addresses stable as mods are discovered (at startup or
+// via refresh()), so &ModEntry handed to a loaded mod as DuskMod* stays valid.
+std::deque<ModEntry> g_entries;
 std::unordered_map<std::string, LoadedLib> g_loaded;  // keyed by mod id
 
 ModEntry* find_entry(std::string_view id) {
@@ -379,16 +380,22 @@ void scan_root(const fs::path& root, std::unordered_set<std::string>& seen) {
     }
 }
 
+// Scan every mods root (next to the executable + in the data folder). `seen`
+// pre-populated with known ids makes this additive (existing mods are skipped).
+void scan_all(std::unordered_set<std::string>& seen) {
+    if (const char* base = SDL_GetBasePath()) {
+        scan_root(fs::path(base) / "mods", seen);
+    }
+    scan_root(dusk::data::configured_data_path() / "mods", seen);
+}
+
 }  // namespace
 
 void initialize() {
     g_entries.clear();
 
     std::unordered_set<std::string> seen;
-    if (const char* base = SDL_GetBasePath()) {
-        scan_root(fs::path(base) / "mods", seen);
-    }
-    scan_root(dusk::data::configured_data_path() / "mods", seen);
+    scan_all(seen);
 
     DuskLog.info("Discovered {} mod(s)", g_entries.size());
 
@@ -410,7 +417,42 @@ void shutdown() {
     }
 }
 
-const std::vector<ModEntry>& list() {
+void refresh() {
+    std::unordered_set<std::string> seen;
+    for (const ModEntry& e : g_entries) {
+        seen.insert(e.id);
+    }
+
+    const std::size_t before = g_entries.size();
+    scan_all(seen);  // only ids not already present are appended
+
+    const std::size_t added = g_entries.size() - before;
+    DuskLog.info("Refresh: {} new mod(s) discovered", added);
+
+    // Enable + load anything newly discovered (deque keeps prior entries stable).
+    for (std::size_t i = before; i < g_entries.size(); ++i) {
+        ModEntry& entry = g_entries[i];
+        entry.enabled = false;  // load_mod sets it on success
+        if (load_mod(entry)) {
+            write_config(entry);
+        }
+    }
+}
+
+bool reload(std::string_view id) {
+    ModEntry* entry = find_entry(id);
+    if (entry == nullptr) {
+        return false;
+    }
+    if (entry->enabled) {
+        unload_mod(*entry);  // dispose + SDL_UnloadObject
+    }
+    const bool ok = load_mod(*entry);  // re-reads the library from disk
+    write_config(*entry);
+    return ok;
+}
+
+const std::deque<ModEntry>& list() {
     return g_entries;
 }
 

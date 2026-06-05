@@ -1,6 +1,7 @@
 #ifndef DUSK_MODS_H
 #define DUSK_MODS_H
 
+#include <deque>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -59,8 +60,18 @@ void initialize();
 // Dispose and unload every loaded mod. Call at shutdown.
 void shutdown();
 
-// All discovered mods, in discovery order.
-const std::vector<ModEntry>& list();
+// Re-scan the mods folder(s); any newly discovered mod is enabled and loaded.
+// Already-known mods are left untouched. Safe to call at runtime.
+void refresh();
+
+// Disable+unload then load a mod again (re-reads its library from disk). Lets a
+// rebuilt mod be tested without restarting the game. Returns true on success.
+bool reload(std::string_view id);
+
+// All discovered mods, in discovery order. Stored in a deque so element
+// addresses stay stable as mods are discovered at runtime (loaded mods hold a
+// pointer to their entry).
+const std::deque<ModEntry>& list();
 
 // Toggle a mod on/off by id: loads+inits or disposes+unloads, then persists to
 // the mod's config.json.
