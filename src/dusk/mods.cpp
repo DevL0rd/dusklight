@@ -238,6 +238,10 @@ ModSetting* find_setting(ModEntry* entry, std::string_view key) {
 
 // ---- per-mod config.json (enabled state + setting values) -------------------
 
+// True only while a mod's init() is running; suppresses config.json writes so a
+// mod touching settings during load can't persist its transient state.
+bool g_loadingMod = false;
+
 fs::path config_path(const ModEntry& entry) {
     return fs::path(entry.folder) / "config.json";
 }
@@ -288,6 +292,9 @@ void apply_setting(ModEntry* entry, std::string_view key, double value) {
         return;
     }
     s->value = value;
+    if (g_loadingMod) {
+        return;  // don't persist while the mod is still initializing
+    }
     write_config(*entry);
 }
 
@@ -362,6 +369,11 @@ void host_define_settings(DuskMod* self, const DuskSetting* arr, uint32_t count)
         s.maxValue = src.max_value;
         s.step = src.step;
         s.value = src.default_value;
+        // Keep any value already live for this key so reloading/redeploying a mod
+        // never resets settings (config.json below still wins when present).
+        if (const ModSetting* prev = find_setting(entry, s.key)) {
+            s.value = prev->value;
+        }
         rebuilt.push_back(std::move(s));
     }
     entry->settings = std::move(rebuilt);
@@ -404,7 +416,10 @@ bool load_mod(ModEntry& entry) {
         return false;
     }
 
-    if (init(&g_host, reinterpret_cast<DuskMod*>(&entry)) != 0) {
+    g_loadingMod = true;
+    const int initRc = init(&g_host, reinterpret_cast<DuskMod*>(&entry));
+    g_loadingMod = false;
+    if (initRc != 0) {
         DuskLog.warn("Mod '{}' init reported failure", entry.id);
         SDL_UnloadObject(handle);
         return false;
@@ -629,12 +644,20 @@ bool reload(std::string_view id) {
         return false;
     }
     if (entry->enabled) {
-        unload_mod(*entry);  // dispose + SDL_UnloadObject
+        unload_mod(*entry);  // dispose + SDL_UnloadObject (clears enabled)
     }
     // Don't persist here: reload is a transient operation and the enabled intent
     // hasn't changed. Persisting a failed reload would wrongly disable the mod in
     // its config.
-    return load_mod(*entry);  // re-reads the library from disk
+    const bool ok = load_mod(*entry);  // re-reads the library from disk
+    if (!ok) {
+        // A hot-reload that fails to re-load must not leave a mod the user had
+        // enabled stuck in the disabled state. Keep the enabled intent so it
+        // stays on in the UI and is retried on the next file change.
+        DuskLog.warn("Mod '{}' hot-reload failed; keeping it enabled to retry", entry->id);
+        entry->enabled = true;
+    }
+    return ok;
 }
 
 void update() {
