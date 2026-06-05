@@ -13,6 +13,7 @@
 #include "dusk/imgui/ImGuiEngine.hpp"
 #include "dusk/io.hpp"
 #include "dusk/livesplit.h"
+#include "dusk/mods.h"
 #include "dusk/discord_presence.hpp"
 #include "graphics_tuner.hpp"
 #include "m_Do/m_Do_main.h"
@@ -33,6 +34,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 
 namespace dusk::ui {
@@ -1485,6 +1487,98 @@ SettingsWindow::SettingsWindow(bool prelaunch) : mPrelaunch(prelaunch) {
         add_speedrun_disabled_option(leftPane, rightPane, getSettings().game.recordingMode,
             "Recording Mode",
             "Disables the game HUD and all background music.<br/><br/>Useful for recording footage.");
+    });
+
+    add_tab("Mods", [this](Rml::Element* content) {
+        // Master-detail: left = list of mods, right = the selected mod's
+        // enable toggle and settings (focusable/editable).
+        auto& leftPane = add_child<Pane>(content, Pane::Type::Controlled);
+        auto& rightPane = add_child<Pane>(content, Pane::Type::Controlled);
+
+        const auto& entries = mods::list();
+        if (entries.empty()) {
+            leftPane.add_section("Mods");
+            leftPane.add_text("No mods installed.");
+            leftPane.add_rml(
+                "<br/>Each mod is a folder inside the <b>mods</b> folder in your Dusklight data "
+                "folder, containing a library for your platform (<i>.so</i>, <i>.dll</i>, or "
+                "<i>.dylib</i>). Restart to detect newly added mods; they then load and unload "
+                "live as you toggle them here.");
+            return;
+        }
+
+        leftPane.add_section("Installed Mods");
+        for (const mods::ModEntry& mod : entries) {
+            const std::string id = mod.id;
+            auto& item = leftPane.add_button(Rml::String{mod.name});
+
+            // Focusing a mod fills the right pane with its details + settings.
+            leftPane.register_control(item, rightPane, [id](Pane& pane) {
+                pane.clear();
+
+                const mods::ModEntry* mod = nullptr;
+                for (const mods::ModEntry& e : mods::list()) {
+                    if (e.id == id) {
+                        mod = &e;
+                        break;
+                    }
+                }
+                if (mod == nullptr) {
+                    return;
+                }
+
+                pane.add_rml(fmt::format("<b>{}</b><br/>{}<br/><br/>Version: {}<br/>Author: {}",
+                    mod->name, mod->about.empty() ? "No description provided." : mod->about,
+                    mod->version.empty() ? "?" : mod->version,
+                    mod->author.empty() ? "Unknown" : mod->author));
+
+                pane.add_section("Options");
+                pane.add_child<BoolButton>(BoolButton::Props{
+                    .key = "Enabled",
+                    .getValue = [id] { return mods::is_enabled(id); },
+                    .setValue =
+                        [id](bool value) {
+                            mDoAud_seStartMenu(kSoundItemChange);
+                            mods::set_enabled(id, value);
+                        },
+                    .isModified = [] { return false; },
+                });
+
+                for (const mods::ModSetting& setting : mod->settings) {
+                    const std::string key = setting.key;
+                    if (setting.type == mods::SettingType::Bool) {
+                        pane.add_child<BoolButton>(BoolButton::Props{
+                            .key = Rml::String{setting.label},
+                            .getValue = [id, key] { return mods::get_setting(id, key) != 0.0; },
+                            .setValue =
+                                [id, key](bool value) {
+                                    mDoAud_seStartMenu(kSoundItemChange);
+                                    mods::set_setting(id, key, value ? 1.0 : 0.0);
+                                },
+                            .isModified = [] { return false; },
+                        });
+                    } else {
+                        const int step = setting.step != 0.0 ? static_cast<int>(setting.step) : 1;
+                        pane.add_child<NumberButton>(NumberButton::Props{
+                            .key = Rml::String{setting.label},
+                            .getValue =
+                                [id, key] {
+                                    return static_cast<int>(std::lround(mods::get_setting(id, key)));
+                                },
+                            .setValue =
+                                [id, key](int value) {
+                                    mDoAud_seStartMenu(kSoundItemChange);
+                                    mods::set_setting(id, key, static_cast<double>(value));
+                                },
+                            .isModified = [] { return false; },
+                            .min = static_cast<int>(setting.minValue),
+                            .max = static_cast<int>(setting.maxValue),
+                            .step = step,
+                        });
+                    }
+                }
+            });
+        }
     });
 }
 

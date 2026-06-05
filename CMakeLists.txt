@@ -490,6 +490,21 @@ endif ()
 target_compile_definitions(dusklight PRIVATE ${GAME_COMPILE_DEFS})
 target_include_directories(dusklight PRIVATE ${GAME_INCLUDE_DIRS})
 target_link_libraries(dusklight PRIVATE aurora::main ${GAME_LIBS} ${JSYSTEM_LINK_LIBRARIES})
+# Export the executable's symbols so native mods can resolve, call, and hook game
+# functions at runtime (adds -rdynamic on Linux/macOS; Windows uses
+# CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS above). Requires LTO off for the symbols to
+# remain addressable, which the non-release presets already ensure.
+set_target_properties(dusklight PROPERTIES ENABLE_EXPORTS ON)
+# Keep functions out-of-line so native mods can hook them by symbol. A detour
+# needs a real, called function; an inlined (or partial-inlined ".part.0")
+# function has no single address to patch. This is the generic counterpart to
+# symbol export -- it makes any game function hookable, at some runtime cost, so
+# new modding capability never requires per-feature game changes.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(dusklight PRIVATE -fno-inline -fno-partial-inlining)
+elseif (NOT MSVC)
+    target_compile_options(dusklight PRIVATE -fno-inline)
+endif ()
 target_precompile_headers(dusklight PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${CMAKE_SOURCE_DIR}/include/dusk_pch.hpp>")
 if (TARGET crashpad_handler)
     add_dependencies(dusklight crashpad_handler)

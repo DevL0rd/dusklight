@@ -55,6 +55,7 @@
 #include "dusk/frame_interpolation.h"
 #include "dusk/game_clock.h"
 #include "dusk/gyro.h"
+#include "dusk/mods.h"
 #include "dusk/mouse.h"
 #include "dusk/imgui/ImGuiConsole.hpp"
 #include "dusk/imgui/ImGuiEngine.hpp"
@@ -355,6 +356,7 @@ void main01(void) {
     } while (dusk::IsRunning);
 
     exit:;
+    dusk::mods::shutdown();
     dusk::ui::shutdown();
 }
 
@@ -556,6 +558,7 @@ int game_main(int argc, char* argv[]) {
         dusk::resetForSpeedrunMode();
     }
     ApplyCVarOverrides(parsed_arg_options["cvar"]);
+    dusk::mods::initialize();
     dusk::crash_reporting::initialize();
     dusk::crash_handler::install();
     // TODO: How to handle this?
